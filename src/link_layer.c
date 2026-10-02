@@ -8,9 +8,96 @@
 #include <stdio.h>
 #include <unistd.h>
 
-// MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
-#define BUF_SIZE 256
+#define FLAG 0x7E
+#define A_TX 0x03
+#define A_RX 0x01
+#define C_SET 0x03
+#define C_UA 0x07
+
+typedef enum {
+    START,
+    FLAG_RCV,
+    A_RCV,
+    C_RCV,
+    BCC_OK,
+    STOP_STATE
+} State;
+
+int alarmEnabled = FALSE;
+int alarmCount = 0;
+
+void alarmHandler()
+{
+    alarmEnabled = FALSE;
+    alarmCount++;
+    printf("Timeout #%d atingido.\n", alarmCount);
+}
+
+int receiveSupervisionFrame(unsigned char expectedA, unsigned char expectedC, int useAlarm)
+{
+    State state = START;
+    unsigned char byte;
+    unsigned char a = 0, c = 0;
+
+    while (state != STOP_STATE && (!useAlarm || alarmEnabled == TRUE))
+    {
+        int res = readByteSerialPort(&byte);
+        if (res <= 0)
+        {
+            continue;
+        }
+
+        switch (state)
+        {
+            case START:
+                if (byte == FLAG)
+                    state = FLAG_RCV;
+                break;
+            case FLAG_RCV:
+                if (byte == FLAG)
+                    state = FLAG_RCV;
+                else if (byte == expectedA)
+                {
+                    state = A_RCV;
+                }
+                else
+                    state = START;
+                break;
+            case A_RCV:
+                if (byte == expectedC)
+                {
+                    c = byte;
+                    state = C_RCV;
+                }  
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+            case C_RCV:
+                if (byte == (a ^ c))
+                    state = BCC_OK;
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+            case BCC_OK:
+                if (byte == FLAG)
+                    state = STOP_STATE;
+                else
+                    state = START;
+                break;
+            default:
+                break;
+        }
+    }
+    
+    if (state == STOP_STATE)
+        return 0;
+
+    return -1;
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
