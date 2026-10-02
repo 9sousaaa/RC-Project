@@ -1,5 +1,4 @@
 // RCOM 2026/2027
-//
 // Application layer protocol implementation
 
 #include "application_layer.h"
@@ -11,28 +10,37 @@
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
-    // ----------------------------------------------------
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
+    LinkLayer linkLayer;
+    strncpy(linkLayer.serialPort, serialPort, sizeof(linkLayer.serialPort) - 1);
+    linkLayer.serialPort[sizeof(linkLayer.serialPort) - 1] = '\0';
+    linkLayer.baudRate = baudRate;
+    linkLayer.nRetransmissions = nTries;
+    linkLayer.timeout = timeout;
 
-    LinkLayer llParameters = {
-        .baudRate = baudRate,
-        .nRetransmissions = nTries,
-        .timeout = timeout,
-    };
-    strcpy(llParameters.serialPort, serialPort);
+    printf("A iniciar o estabelecimento da ligacao...\n");
 
     if (strcmp(role, "tx") == 0)
     {
-        llOpenTx(llParameters);
+        if (llOpenTx(linkLayer) < 0)
+        {
+            printf("Erro: Nao foi possivel estabelecer a ligacao (Tx).\n");
+            return;
+        }
+        printf("Ligacao estabelecida com sucesso (Tx)!\n");
+        llCloseTx();
     }
     else if (strcmp(role, "rx") == 0)
     {
-        llOpenRx(llParameters);
+        if (llOpenRx(linkLayer) < 0)
+        {
+            printf("Erro: Nao foi possivel estabelecer a ligacao (Rx).\n");
+            return;
+        }
+        printf("Ligacao estabelecida com sucesso (Rx)!\n");
+        llCloseRx();
     }
     else
     {
-        printf("Invalid role: %s. Must be 'tx' or 'rx'.\n", role);
-        return;
+        printf("Erro: Papel desconhecido (%s)\n", role);
     }
 }
