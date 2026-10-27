@@ -19,12 +19,12 @@
 #define C_SET 0x03
 #define C_UA 0x07
 #define C_DISC 0x0B
-#define C_RR0 0x05
-#define C_RR1 0x85
-#define C_REJ0 0x01
-#define C_REJ1 0x81
+#define C_RR0 0xAA
+#define C_RR1 0xAB
+#define C_REJ0 0x54
+#define C_REJ1 0x55
 #define C_I0 0x00
-#define C_I1 0x40
+#define C_I1 0x80
 
 typedef enum { START, FLAG_RCV, A_RCV, C_RCV, BCC_OK, STOP_STATE } State;
 
@@ -34,6 +34,8 @@ int timeout_g = 0;
 int nRetransmissions_g = 0;
 int tx_s = 0;
 int rx_r = 0;
+int rxDiscReceived = FALSE;   // Rx: DISC ja recebido dentro do llReceive
+int rxLinkLost = FALSE;       // Rx: ligacao perdida (timeout de inatividade)
 
 // Estatisticas
 static int stat_framesSent = 0, stat_retrans = 0, stat_rej = 0, stat_timeouts = 0;
@@ -112,7 +114,19 @@ int llOpenTx(LinkLayer llParameters) {
 
 int llOpenRx(LinkLayer llParameters) {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0) return -1;
+
+    // O Rx tambem precisa do alarme: timeout de inatividade no llReceive
+    // e retransmissao do DISC no llCloseRx
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    sigaction(SIGALRM, &act, NULL);
+
+    timeout_g = llParameters.timeout;
+    nRetransmissions_g = llParameters.nRetransmissions;
     rx_r = 0;
+    rxDiscReceived = FALSE;
+    rxLinkLost = FALSE;
+
     if (receiveSupervisionFrame(A_CMD, C_SET, 0) == 0) {
         sendSupervisionFrame(A_CMD, C_UA);
         return 0;
@@ -215,10 +229,22 @@ int llReceive(unsigned char *packet) {
     unsigned char* destuffed = malloc(CAP);
     if (!destuffed) return -1;
 
+    // Se nada chegar durante este tempo, o Tx desistiu (esgotou as tentativas
+    // das tramas I e do DISC): o Rx desiste tambem em vez de ficar bloqueado
+    const int inactivity = timeout_g * (2 * nRetransmissions_g + 1);
+
     while (1) {
         // --- le uma trama completa (ate ao FLAG final) ---
         state = 0; j = 0; overflow = FALSE;
+        alarmEnabled = TRUE;
+        alarm(inactivity);
         while (state != 5) {
+            if (!alarmEnabled) {
+                printf("Rx: sem atividade na ligacao, a desistir\n");
+                rxLinkLost = TRUE;
+                free(destuffed);
+                return -1;
+            }
             if (readByteSerialPort(&byte) > 0) {
                 switch(state) {
                     case 0: if (byte == FLAG) state = 1; break;
@@ -228,7 +254,7 @@ int llReceive(unsigned char *packet) {
                         else state = 0;
                         break;
                     case 2:
-                        if (byte == C_I0 || byte == C_I1 || byte == C_SET) { control_field = byte; state = 3; }
+                        if (byte == C_I0 || byte == C_I1 || byte == C_SET || byte == C_DISC) { control_field = byte; state = 3; }
                         else if (byte == FLAG) state = 1;
                         else state = 0;
                         break;
@@ -245,11 +271,19 @@ int llReceive(unsigned char *packet) {
                 }
             }
         }
+        alarm(0);
 
         // SET repetido (o UA anterior perdeu-se): responde outra vez
         if (control_field == C_SET) {
             sendSupervisionFrame(A_CMD, C_UA);
             continue;
+        }
+
+        // DISC: o Tx terminou a ligacao (normalmente ou porque desistiu)
+        if (control_field == C_DISC) {
+            rxDiscReceived = TRUE;
+            free(destuffed);
+            return -1;
         }
 
         // --- destuffing ---
@@ -267,7 +301,8 @@ int llReceive(unsigned char *packet) {
         int dup = (seq_rcv != rx_r);
 
         int bcc_ok = FALSE;
-        if (!overflow && k >= 1) {
+        // k - 1 bytes de dados tem de caber no buffer da aplicacao
+        if (!overflow && k >= 1 && k - 1 <= MAX_PAYLOAD_SIZE) {
             unsigned char calc = 0;
             for (int i = 0; i < k - 1; i++) calc ^= destuffed[i];
             bcc_ok = (calc == destuffed[k - 1]);
@@ -322,14 +357,36 @@ int llCloseTx() {
     }
     if (discReceived) sendSupervisionFrame(A_RSP, C_UA);
     printStats("Tx");
-    return closeSerialPort();
+    if (closeSerialPort() < 0) return -1;
+    return discReceived ? 0 : -1;
 }
 
 int llCloseRx() {
-    if (receiveSupervisionFrame(A_CMD, C_DISC, 0) == 0) {
-        sendSupervisionFrame(A_RSP, C_DISC);
-        receiveSupervisionFrame(A_RSP, C_UA, 0);
+    // Ainda nao veio o DISC: continua a responder as tramas I que cheguem
+    // (p.ex. o END retransmitido porque o ultimo RR se perdeu) ate chegar o DISC
+    if (!rxDiscReceived && !rxLinkLost) {
+        unsigned char *tmp = malloc(MAX_PAYLOAD_SIZE);
+        if (tmp) {
+            while (llReceive(tmp) >= 0) ;   // descarta dados; sai com DISC ou inatividade
+            free(tmp);
+        }
+    }
+
+    int uaReceived = FALSE;
+    if (rxDiscReceived) {
+        // O DISC do Rx e um comando: protegido por temporizador
+        alarmCount = 0;
+        while (alarmCount < nRetransmissions_g && !uaReceived) {
+            sendSupervisionFrame(A_RSP, C_DISC);
+            alarmEnabled = TRUE;
+            alarm(timeout_g);
+            if (receiveSupervisionFrame(A_RSP, C_UA, 1) == 0) {
+                uaReceived = TRUE;
+                alarm(0);
+            }
+        }
     }
     printStats("Rx");
-    return closeSerialPort();
+    if (closeSerialPort() < 0) return -1;
+    return uaReceived ? 0 : -1;
 }

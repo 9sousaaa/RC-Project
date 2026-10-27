@@ -6,8 +6,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define CTRL_DATA 1
-#define CTRL_START 2
+#define CTRL_START 1
+#define CTRL_DATA 2
 #define CTRL_END 3
 
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
@@ -56,23 +56,22 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
         unsigned char buf[800];
         int bytes_read;
-        int seq = 0;
         
         while ((bytes_read = fread(buf, 1, 800, f)) > 0) {
-            unsigned char* dp = malloc(bytes_read + 4);
+            // Pacote de dados: C L2 L1 P1..Pk  (K = 256 * L2 + L1)
+            unsigned char* dp = malloc(bytes_read + 3);
+            if (!dp) break;
             dp[0] = CTRL_DATA;
-            dp[1] = seq % 256;
-            dp[2] = (bytes_read >> 8) & 0xFF;
-            dp[3] = bytes_read & 0xFF;
-            memcpy(&dp[4], buf, bytes_read);
+            dp[1] = (bytes_read >> 8) & 0xFF;
+            dp[2] = bytes_read & 0xFF;
+            memcpy(&dp[3], buf, bytes_read);
             
-            if (llSend(dp, bytes_read + 4) < 0) {
+            if (llSend(dp, bytes_read + 3) < 0) {
                 printf("Erro ao enviar dados.\n");
                 free(dp);
                 break;
             }
             free(dp);
-            seq++;
         }
 
         int ok = (bytes_read == 0 && !ferror(f));
@@ -95,20 +94,39 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         if (!f) { perror("fopen"); llCloseRx(); return; }
         
         unsigned char packet[MAX_PAYLOAD_SIZE];
+        long expected_size = -1, received_size = 0;
+        int got_end = 0;
         while (1) {
             int n = llReceive(packet);
-            if (n > 0) {
-                if (packet[0] == CTRL_START) continue;
-                else if (packet[0] == CTRL_DATA) {
-                    int p_size = (packet[2] << 8) | packet[3];
-                    if (n < 4 || p_size > n - 4) continue;   // pacote inconsistente
-                    fwrite(&packet[4], 1, p_size, f);
+            if (n < 0) break;               // ligacao terminada (DISC) ou perdida
+            if (n < 1) continue;
+            if (packet[0] == CTRL_START) {
+                // TLV: procura o tamanho do ficheiro (T = 0)
+                int i = 1;
+                while (i + 1 < n) {
+                    int T = packet[i], L = packet[i + 1];
+                    if (i + 2 + L > n) break;
+                    if (T == 0) {
+                        expected_size = 0;
+                        for (int b = 0; b < L; b++) expected_size = (expected_size << 8) | packet[i + 2 + b];
+                    }
+                    i += 2 + L;
                 }
-                else if (packet[0] == CTRL_END) break;
             }
+            else if (packet[0] == CTRL_DATA) {
+                if (n < 3) continue;
+                int p_size = (packet[1] << 8) | packet[2];   // K = 256 * L2 + L1
+                if (p_size > n - 3) continue;   // pacote inconsistente
+                fwrite(&packet[3], 1, p_size, f);
+                received_size += p_size;
+            }
+            else if (packet[0] == CTRL_END) { got_end = 1; break; }
         }
         fclose(f);
         llCloseRx();
-        printf("Ficheiro recebido com sucesso!\n");
+        if (got_end && (expected_size < 0 || received_size == expected_size))
+            printf("Ficheiro recebido com sucesso! (%ld bytes)\n", received_size);
+        else
+            printf("Falha na rececao do ficheiro (recebidos %ld de %ld bytes).\n", received_size, expected_size);
     }
 }
